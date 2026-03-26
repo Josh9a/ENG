@@ -1,658 +1,701 @@
-// Audio Reading App for Kids - JavaScript
-class AudioReadingApp {
+// English Reader - Complete Rewrite
+// Features: Web Speech API + Piper Offline TTS, file extraction, proper pause/resume
+
+// ─── Text Extraction ──────────────────────────────────────────────────────────
+
+async function extractText(file) {
+    const name = file.name.toLowerCase();
+    const type = file.type;
+
+    if (file.size > 10 * 1024 * 1024) {
+        throw new Error('File too large (max 10 MB)');
+    }
+
+    if (type.startsWith('text/') || name.endsWith('.txt')) {
+        return readAsText(file);
+    }
+    if (name.endsWith('.docx')) {
+        return extractDocx(file);
+    }
+    if (type === 'application/pdf' || name.endsWith('.pdf')) {
+        return extractPdf(file);
+    }
+    if (type.startsWith('image/')) {
+        return extractImage(file);
+    }
+    throw new Error('Unsupported format. Use .txt, .docx, .pdf, or image files.');
+}
+
+function readAsText(file) {
+    return new Promise((resolve, reject) => {
+        const r = new FileReader();
+        r.onload = () => resolve(r.result);
+        r.onerror = () => reject(new Error('Failed to read file'));
+        r.readAsText(file);
+    });
+}
+
+async function extractDocx(file) {
+    if (typeof mammoth === 'undefined') {
+        await loadScript('https://cdnjs.cloudflare.com/ajax/libs/mammoth/1.8.0/mammoth.browser.min.js');
+    }
+    const arrayBuffer = await file.arrayBuffer();
+    const result = await mammoth.extractRawText({ arrayBuffer });
+    return result.value;
+}
+
+async function extractPdf(file) {
+    if (!window.pdfjsLib) {
+        await loadScript('https://cdnjs.cloudflare.com/ajax/libs/pdf.js/4.4.168/pdf.min.mjs', true);
+        window.pdfjsLib = globalThis.pdfjsLib;
+    }
+    const arrayBuffer = await file.arrayBuffer();
+    const pdf = await pdfjsLib.getDocument({ data: arrayBuffer }).promise;
+    let text = '';
+    for (let i = 1; i <= pdf.numPages; i++) {
+        const page = await pdf.getPage(i);
+        const content = await page.getTextContent();
+        text += content.items.map(item => item.str).join(' ') + '\n';
+    }
+    return text;
+}
+
+async function extractImage(file) {
+    if (!window.Tesseract) {
+        await loadScript('https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js');
+    }
+    const worker = await Tesseract.createWorker('eng');
+    const { data: { text } } = await worker.recognize(file);
+    await worker.terminate();
+    return text;
+}
+
+function loadScript(src, isModule = false) {
+    return new Promise((resolve, reject) => {
+        const el = document.createElement('script');
+        el.src = src;
+        if (isModule) el.type = 'module';
+        el.onload = resolve;
+        el.onerror = () => reject(new Error(`Failed to load: ${src}`));
+        document.head.appendChild(el);
+    });
+}
+
+// ─── OPFS Storage Helpers ─────────────────────────────────────────────────────
+
+const OPFS = {
+    async getDir(name) {
+        const root = await navigator.storage.getDirectory();
+        return root.getDirectoryHandle(name, { create: true });
+    },
+    async has(dirName, fileName) {
+        try {
+            const dir = await this.getDir(dirName);
+            await dir.getFileHandle(fileName);
+            return true;
+        } catch { return false; }
+    },
+    async read(dirName, fileName) {
+        const dir = await this.getDir(dirName);
+        const fh = await dir.getFileHandle(fileName);
+        const file = await fh.getFile();
+        return file.arrayBuffer();
+    },
+    async write(dirName, fileName, data) {
+        const dir = await this.getDir(dirName);
+        const fh = await dir.getFileHandle(fileName, { create: true });
+        const writable = await fh.createWritable();
+        await writable.write(data);
+        await writable.close();
+    }
+};
+
+// ─── Piper TTS Engine ─────────────────────────────────────────────────────────
+
+class PiperTTS {
     constructor() {
-        this.currentText = '';
-        this.words = [];
-        this.currentWordIndex = 0;
-        this.isPlaying = false;
-        this.isPaused = false;
-        this.pauseDuration = 1000; // milliseconds
-        this.speechSynthesis = window.speechSynthesis;
-        this.currentUtterance = null;
-        this.availableVoices = [];
+        this.engine = null;
+        this.ready = false;
+        this.loading = false;
+        this.currentVoice = null;
+        this.audioCtx = null;
+    }
+
+    async init(voiceId, onProgress) {
+        if (this.loading) return;
+        this.loading = true;
+        this.ready = false;
+
+        try {
+            // Dynamic import from esm.sh CDN
+            const mod = await import('https://esm.sh/piper-tts-web@1.1.2');
+            const { PiperWebEngine } = mod;
+
+            if (onProgress) onProgress(10, 'Initializing TTS engine...');
+
+            // Check if model is cached in OPFS
+            const modelFile = voiceId + '.onnx';
+            const configFile = voiceId + '.onnx.json';
+            const opfsDir = 'piper-models';
+            let modelData, configData;
+
+            const hasCached = await OPFS.has(opfsDir, modelFile);
+
+            if (hasCached) {
+                if (onProgress) onProgress(20, 'Loading cached model...');
+                modelData = await OPFS.read(opfsDir, modelFile);
+                configData = await OPFS.read(opfsDir, configFile);
+                if (onProgress) onProgress(80, 'Model loaded from cache');
+            } else {
+                // Download from HuggingFace
+                const baseUrl = this._getModelUrl(voiceId);
+
+                if (onProgress) onProgress(15, 'Downloading voice model...');
+                const modelResp = await fetch(baseUrl + modelFile);
+                if (!modelResp.ok) throw new Error('Failed to download model: ' + modelResp.status);
+                modelData = await modelResp.arrayBuffer();
+
+                if (onProgress) onProgress(60, 'Downloading config...');
+                const configResp = await fetch(baseUrl + configFile);
+                if (!configResp.ok) throw new Error('Failed to download config: ' + configResp.status);
+                configData = await configResp.arrayBuffer();
+
+                // Cache in OPFS
+                if (onProgress) onProgress(70, 'Caching for offline use...');
+                await OPFS.write(opfsDir, modelFile, modelData);
+                await OPFS.write(opfsDir, configFile, configData);
+                if (onProgress) onProgress(80, 'Cached in OPFS');
+            }
+
+            // Create engine
+            if (onProgress) onProgress(85, 'Loading into TTS engine...');
+
+            const modelBlob = new Blob([modelData], { type: 'application/octet-stream' });
+            const configBlob = new Blob([configData], { type: 'application/json' });
+
+            this.engine = new PiperWebEngine();
+            await this.engine.init(modelBlob, configBlob);
+
+            this.currentVoice = voiceId;
+            this.ready = true;
+            if (onProgress) onProgress(100, 'Ready!');
+
+        } catch (err) {
+            console.error('Piper init failed:', err);
+            throw err;
+        } finally {
+            this.loading = false;
+        }
+    }
+
+    _getModelUrl(voiceId) {
+        // voiceId format: "en_GB-jenny_dioco-medium"
+        const parts = voiceId.split('-');
+        const lang = parts[0]; // en_GB
+        const langShort = lang.split('_')[0]; // en
+        const name = parts.slice(1, -1).join('-'); // jenny_dioco
+        const quality = parts[parts.length - 1]; // medium
+        return `https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/${langShort}/${lang}/${name}/${quality}/`;
+    }
+
+    async speak(text) {
+        if (!this.ready || !this.engine) throw new Error('Piper not ready');
+
+        const result = await this.engine.generate(text, this.currentVoice, 0);
+        if (!result || !result.file) throw new Error('No audio generated');
+
+        return new Promise((resolve, reject) => {
+            const audio = new Audio();
+            audio.src = URL.createObjectURL(result.file);
+            audio.onended = () => {
+                URL.revokeObjectURL(audio.src);
+                resolve();
+            };
+            audio.onerror = () => {
+                URL.revokeObjectURL(audio.src);
+                reject(new Error('Audio playback failed'));
+            };
+            audio.play().catch(reject);
+        });
+    }
+}
+
+// ─── Browser TTS (Web Speech API) ─────────────────────────────────────────────
+
+class BrowserTTS {
+    constructor() {
+        this.voices = [];
         this.selectedVoice = null;
-        this.voicesLoaded = false;
-        
-        this.init();
+        this.loaded = false;
+        this.rate = 1.0;
     }
 
     init() {
-        this.bindEvents();
-        this.loadUserPreferences();
-        this.setupDragAndDrop();
-        this.initializeVoices();
-    }
-
-    bindEvents() {
-        // File upload
-        const fileInput = document.getElementById('fileInput');
-        const uploadArea = document.getElementById('uploadArea');
-        
-        fileInput.addEventListener('change', (e) => this.handleFileSelect(e));
-        uploadArea.addEventListener('click', () => fileInput.click());
-
-        // Pause slider
-        const pauseSlider = document.getElementById('pauseSlider');
-        pauseSlider.addEventListener('input', (e) => this.updatePauseDuration(e.target.value));
-
-        // Voice selection
-        const voiceSelect = document.getElementById('voiceSelect');
-        voiceSelect.addEventListener('change', (e) => this.selectVoice(e.target.value));
-
-        // Audio controls
-        document.getElementById('playBtn').addEventListener('click', () => this.play());
-        document.getElementById('pauseBtn').addEventListener('click', () => this.pause());
-        document.getElementById('stopBtn').addEventListener('click', () => this.stop());
-        document.getElementById('restartBtn').addEventListener('click', () => this.restart());
-
-        // Download buttons
-        document.getElementById('downloadHtml').addEventListener('click', () => this.downloadFile('html'));
-        document.getElementById('downloadCss').addEventListener('click', () => this.downloadFile('css'));
-        document.getElementById('downloadJs').addEventListener('click', () => this.downloadFile('js'));
-        document.getElementById('downloadAll').addEventListener('click', () => this.downloadAllFiles());
-    }
-
-    setupDragAndDrop() {
-        const uploadArea = document.getElementById('uploadArea');
-        
-        uploadArea.addEventListener('dragover', (e) => {
-            e.preventDefault();
-            uploadArea.classList.add('dragover');
-        });
-
-        uploadArea.addEventListener('dragleave', (e) => {
-            e.preventDefault();
-            uploadArea.classList.remove('dragover');
-        });
-
-        uploadArea.addEventListener('drop', (e) => {
-            e.preventDefault();
-            uploadArea.classList.remove('dragover');
-            const files = e.dataTransfer.files;
-            if (files.length > 0) {
-                this.processFile(files[0]);
-            }
-        });
-    }
-
-    initializeVoices() {
-        // Multiple approaches to ensure voices are loaded
-        this.loadVoices();
-        
-        // Listen for voiceschanged event
-        if (this.speechSynthesis.addEventListener) {
-            this.speechSynthesis.addEventListener('voiceschanged', () => {
-                if (!this.voicesLoaded) {
-                    this.loadVoices();
+        return new Promise((resolve) => {
+            const tryLoad = () => {
+                const v = speechSynthesis.getVoices();
+                if (v.length > 0) {
+                    this.voices = v;
+                    this.loaded = true;
+                    resolve();
+                    return true;
                 }
-            });
-        }
+                return false;
+            };
 
-        // Fallback polling for browsers that don't fire voiceschanged
-        let attempts = 0;
-        const pollVoices = () => {
-            attempts++;
-            if (!this.voicesLoaded && attempts < 50) {
-                this.loadVoices();
-                setTimeout(pollVoices, 100);
-            }
-        };
-        setTimeout(pollVoices, 100);
+            if (tryLoad()) return;
+
+            speechSynthesis.addEventListener('voiceschanged', () => tryLoad());
+
+            // Polling fallback for Android Chrome
+            let attempts = 0;
+            const poll = () => {
+                if (this.loaded || attempts++ > 50) { resolve(); return; }
+                if (!tryLoad()) setTimeout(poll, 100);
+            };
+            setTimeout(poll, 100);
+        });
     }
 
-    loadVoices() {
-        const voices = this.speechSynthesis.getVoices();
-        
-        if (voices.length === 0) {
-            return; // Voices not ready yet
-        }
+    getVoicesSorted() {
+        return [...this.voices].sort((a, b) => {
+            return this._score(b) - this._score(a);
+        });
+    }
 
-        this.availableVoices = voices;
-        this.voicesLoaded = true;
-        
-        const voiceSelect = document.getElementById('voiceSelect');
-        
-        // Clear existing options
-        voiceSelect.innerHTML = '';
+    _score(v) {
+        let s = 0;
+        const lang = v.lang.toLowerCase();
+        const name = v.name.toLowerCase();
+        if (lang.includes('en-in')) s += 100;
+        if (lang.includes('hi-in')) s += 90;
+        if (name.includes('indian')) s += 80;
+        if (name.includes('india')) s += 70;
+        if (lang.includes('en-us')) s += 50;
+        if (lang.includes('en-gb')) s += 40;
+        if (lang.startsWith('en')) s += 30;
+        return s;
+    }
 
-        if (voices.length === 0) {
-            const option = document.createElement('option');
-            option.value = '';
-            option.textContent = 'No voices available';
-            voiceSelect.appendChild(option);
+    selectVoice(voice) {
+        this.selectedVoice = voice;
+    }
+
+    speak(word) {
+        return new Promise((resolve) => {
+            // Cancel any stuck utterances first
+            speechSynthesis.cancel();
+
+            const u = new SpeechSynthesisUtterance(word);
+            if (this.selectedVoice) {
+                u.voice = this.selectedVoice;
+                u.lang = this.selectedVoice.lang;
+            }
+            u.rate = this.rate;
+            u.pitch = 1.0;
+            u.volume = 1.0;
+            u.onend = () => resolve();
+            u.onerror = () => resolve();
+            speechSynthesis.speak(u);
+        });
+    }
+}
+
+// ─── Main Application ─────────────────────────────────────────────────────────
+
+class ReadingApp {
+    constructor() {
+        this.browserTTS = new BrowserTTS();
+        this.piperTTS = new PiperTTS();
+        this.engine = 'browser'; // 'browser' or 'piper'
+
+        this.words = [];
+        this.wordIndex = 0;
+        this.isPlaying = false;
+        this.isPaused = false;
+        this.pauseMs = 1000;
+        this.speed = 1.0;
+        this._abortController = null;
+
+        this._bindElements();
+        this._bindEvents();
+        this._initVoices();
+    }
+
+    // ── Setup ──
+
+    _bindElements() {
+        this.els = {
+            textInput: document.getElementById('textInput'),
+            fileInput: document.getElementById('fileInput'),
+            uploadArea: document.getElementById('uploadArea'),
+            uploadProgress: document.getElementById('uploadProgress'),
+            progressFill: document.getElementById('progressFill'),
+            progressText: document.getElementById('progressText'),
+            voiceSelect: document.getElementById('voiceSelect'),
+            piperVoiceSelect: document.getElementById('piperVoiceSelect'),
+            pauseSlider: document.getElementById('pauseSlider'),
+            pauseValue: document.getElementById('pauseValue'),
+            speedSlider: document.getElementById('speedSlider'),
+            speedValue: document.getElementById('speedValue'),
+            playBtn: document.getElementById('playBtn'),
+            pauseResumeBtn: document.getElementById('pauseResumeBtn'),
+            stopBtn: document.getElementById('stopBtn'),
+            readingStatus: document.getElementById('readingStatus'),
+            readingProgress: document.getElementById('readingProgress'),
+            btnEngineBrowser: document.getElementById('btnEngineBrowser'),
+            btnEnginePiper: document.getElementById('btnEnginePiper'),
+            browserVoicePanel: document.getElementById('browserVoicePanel'),
+            piperVoicePanel: document.getElementById('piperVoicePanel'),
+            downloadVoiceBtn: document.getElementById('downloadVoiceBtn'),
+            piperStatus: document.getElementById('piperStatus'),
+            modelProgress: document.getElementById('modelProgress'),
+            modelProgressFill: document.getElementById('modelProgressFill'),
+            modelProgressText: document.getElementById('modelProgressText'),
+            statusToast: document.getElementById('statusToast'),
+            toastIcon: document.getElementById('toastIcon'),
+            toastText: document.getElementById('toastText'),
+            loadingOverlay: document.getElementById('loadingOverlay'),
+            loadingText: document.getElementById('loadingText'),
+        };
+    }
+
+    _bindEvents() {
+        // File upload
+        this.els.fileInput.addEventListener('change', (e) => {
+            if (e.target.files[0]) this._handleFile(e.target.files[0]);
+        });
+        this.els.uploadArea.addEventListener('click', (e) => {
+            if (e.target === this.els.fileInput) return;
+            this.els.fileInput.click();
+        });
+        this.els.uploadArea.addEventListener('dragover', (e) => {
+            e.preventDefault();
+            this.els.uploadArea.classList.add('dragover');
+        });
+        this.els.uploadArea.addEventListener('dragleave', (e) => {
+            e.preventDefault();
+            this.els.uploadArea.classList.remove('dragover');
+        });
+        this.els.uploadArea.addEventListener('drop', (e) => {
+            e.preventDefault();
+            this.els.uploadArea.classList.remove('dragover');
+            if (e.dataTransfer.files[0]) this._handleFile(e.dataTransfer.files[0]);
+        });
+
+        // Controls
+        this.els.pauseSlider.addEventListener('input', (e) => {
+            this.pauseMs = parseFloat(e.target.value) * 1000;
+            this.els.pauseValue.textContent = parseFloat(e.target.value).toFixed(1);
+        });
+        this.els.speedSlider.addEventListener('input', (e) => {
+            this.speed = parseFloat(e.target.value);
+            this.els.speedValue.textContent = parseFloat(e.target.value).toFixed(1);
+            this.browserTTS.rate = this.speed;
+        });
+        this.els.voiceSelect.addEventListener('change', (e) => {
+            const idx = parseInt(e.target.value);
+            if (!isNaN(idx)) {
+                this.browserTTS.selectVoice(this.browserTTS.voices[idx]);
+            }
+        });
+
+        // Playback
+        this.els.playBtn.addEventListener('click', () => this.play());
+        this.els.pauseResumeBtn.addEventListener('click', () => this.togglePauseResume());
+        this.els.stopBtn.addEventListener('click', () => this.stop());
+
+        // Engine toggle
+        this.els.btnEngineBrowser.addEventListener('click', () => this._setEngine('browser'));
+        this.els.btnEnginePiper.addEventListener('click', () => this._setEngine('piper'));
+
+        // Piper download
+        this.els.downloadVoiceBtn.addEventListener('click', () => this._downloadPiperVoice());
+    }
+
+    async _initVoices() {
+        await this.browserTTS.init();
+        this._populateVoiceSelect();
+    }
+
+    _populateVoiceSelect() {
+        const select = this.els.voiceSelect;
+        select.innerHTML = '';
+
+        if (this.browserTTS.voices.length === 0) {
+            select.innerHTML = '<option value="">No voices found</option>';
             return;
         }
 
-        // Sort voices to prioritize Indian voices
-        const sortedVoices = [...voices].sort((a, b) => {
-            const aScore = this.getVoiceScore(a);
-            const bScore = this.getVoiceScore(b);
-            return bScore - aScore;
+        const sorted = this.browserTTS.getVoicesSorted();
+        sorted.forEach((voice) => {
+            const origIdx = this.browserTTS.voices.indexOf(voice);
+            const opt = document.createElement('option');
+            opt.value = origIdx;
+            const isIndian = voice.lang.includes('en-IN') || voice.lang.includes('hi-IN');
+            opt.textContent = `${voice.name} (${voice.lang})${isIndian ? ' *' : ''}`;
+            select.appendChild(opt);
         });
 
-        sortedVoices.forEach((voice, index) => {
-            const option = document.createElement('option');
-            const originalIndex = voices.indexOf(voice);
-            option.value = originalIndex;
-            option.textContent = `${voice.name} (${voice.lang})`;
-            if (voice.lang.includes('en-IN') || voice.lang.includes('hi-IN')) {
-                option.textContent += ' ⭐';
-            }
-            voiceSelect.appendChild(option);
-        });
-
-        // Select the best Indian voice by default
-        const bestVoice = sortedVoices.find(voice => 
-            voice.lang.includes('en-IN') || voice.lang.includes('hi-IN')
-        ) || sortedVoices[0];
-        
-        if (bestVoice) {
-            const bestIndex = voices.indexOf(bestVoice);
-            voiceSelect.value = bestIndex;
-            this.selectedVoice = bestVoice;
-            this.showStatus(`Voice loaded: ${bestVoice.name}`, 'success');
+        // Auto-select best Indian voice
+        const best = sorted[0];
+        if (best) {
+            const idx = this.browserTTS.voices.indexOf(best);
+            select.value = idx;
+            this.browserTTS.selectVoice(best);
         }
+
+        this._updateButtons();
     }
 
-    getVoiceScore(voice) {
-        let score = 0;
-        const lang = voice.lang.toLowerCase();
-        const name = voice.name.toLowerCase();
-        
-        // Prioritize Indian voices
-        if (lang.includes('en-in')) score += 100;
-        if (lang.includes('hi-in')) score += 90;
-        if (name.includes('indian')) score += 80;
-        if (name.includes('hindi')) score += 70;
-        if (lang.includes('en-us')) score += 50;
-        if (lang.includes('en-gb')) score += 40;
-        if (lang.startsWith('en')) score += 30;
-        
-        return score;
+    // ── Engine Toggle ──
+
+    _setEngine(engine) {
+        this.engine = engine;
+        this.els.btnEngineBrowser.classList.toggle('active', engine === 'browser');
+        this.els.btnEnginePiper.classList.toggle('active', engine === 'piper');
+        this.els.browserVoicePanel.classList.toggle('hidden', engine !== 'browser');
+        this.els.piperVoicePanel.classList.toggle('hidden', engine !== 'piper');
+        this._updateButtons();
     }
 
-    selectVoice(voiceIndex) {
-        const index = parseInt(voiceIndex);
-        if (!isNaN(index) && this.availableVoices[index]) {
-            this.selectedVoice = this.availableVoices[index];
-            this.saveUserPreferences();
-            this.showStatus(`Voice selected: ${this.selectedVoice.name}`, 'info');
-        }
-    }
+    async _downloadPiperVoice() {
+        const voiceId = this.els.piperVoiceSelect.value;
+        if (!voiceId) return;
 
-    handleFileSelect(event) {
-        const file = event.target.files[0];
-        if (file) {
-            this.processFile(file);
-        }
-    }
+        this.els.downloadVoiceBtn.disabled = true;
+        this.els.modelProgress.classList.remove('hidden');
+        this._setPiperStatus('loading', 'Initializing...');
 
-    async processFile(file) {
-        this.showLoading(true);
-        this.showProgress(0);
-        
         try {
-            // Validate file size (10MB limit)
-            if (file.size > 10 * 1024 * 1024) {
-                throw new Error('File size too large. Please select a file smaller than 10MB.');
-            }
+            await this.piperTTS.init(voiceId, (pct, msg) => {
+                this.els.modelProgressFill.style.width = pct + '%';
+                this.els.modelProgressText.textContent = msg;
+                this._setPiperStatus('loading', msg);
+            });
 
-            const fileType = file.type;
-            const fileName = file.name.toLowerCase();
-            let extractedText = '';
-
-            this.showProgress(25);
-
-            if (fileType.startsWith('text/') || fileName.endsWith('.txt')) {
-                extractedText = await this.extractTextFromTxt(file);
-            } else if (fileName.endsWith('.docx')) {
-                extractedText = await this.extractTextFromDocx(file);
-            } else if (fileType === 'application/pdf' || fileName.endsWith('.pdf')) {
-                extractedText = await this.extractTextFromPdf(file);
-            } else if (fileType.startsWith('image/')) {
-                extractedText = await this.extractTextFromImage(file);
-            } else {
-                throw new Error('Unsupported file format. Please use .txt, .docx, .pdf, or image files.');
-            }
-
-            this.showProgress(75);
-
-            if (!extractedText.trim()) {
-                throw new Error('No text content found in the file.');
-            }
-
-            this.currentText = extractedText;
-            this.prepareText();
-            this.displayText();
-            this.enableControls();
-            
-            this.showProgress(100);
-            this.showStatus('File processed successfully! Ready to start reading.', 'success');
-            
-        } catch (error) {
-            console.error('Error processing file:', error);
-            this.showStatus(error.message, 'error');
+            this._setPiperStatus('ready', 'Voice ready! You can now use Piper offline.');
+            this._toast('Piper voice downloaded and cached!', 'success');
+        } catch (err) {
+            this._setPiperStatus('error', 'Failed: ' + err.message);
+            this._toast('Piper download failed: ' + err.message, 'error');
         } finally {
-            this.showLoading(false);
-            setTimeout(() => this.hideProgress(), 1000);
+            this.els.downloadVoiceBtn.disabled = false;
+            setTimeout(() => this.els.modelProgress.classList.add('hidden'), 2000);
+            this._updateButtons();
         }
     }
 
-    async extractTextFromTxt(file) {
-        return new Promise((resolve, reject) => {
-            const reader = new FileReader();
-            reader.onload = (e) => resolve(e.target.result);
-            reader.onerror = () => reject(new Error('Failed to read text file'));
-            reader.readAsText(file);
-        });
+    _setPiperStatus(type, msg) {
+        this.els.piperStatus.className = `piper-status ${type}`;
+        this.els.piperStatus.textContent = msg;
+        this.els.piperStatus.classList.remove('hidden');
     }
 
-    async extractTextFromDocx(file) {
-        // For demo purposes, provide clear instructions
-        this.showStatus('DOCX files: Please save as .txt format first, or copy-paste the text content into a .txt file.', 'info');
-        throw new Error('Please convert DOCX to .txt format for processing');
-    }
+    // ── File Handling ──
 
-    async extractTextFromPdf(file) {
-        // For demo purposes, provide clear instructions
-        this.showStatus('PDF files: Please copy the text content and save as .txt format first.', 'info');
-        throw new Error('Please convert PDF content to .txt format for processing');
-    }
+    async _handleFile(file) {
+        this.els.loadingOverlay.classList.remove('hidden');
+        this.els.loadingText.textContent = 'Processing file...';
+        this.els.uploadProgress.classList.remove('hidden');
+        this.els.progressFill.style.width = '0%';
 
-    async extractTextFromImage(file) {
-        // For demo purposes, provide clear instructions
-        this.showStatus('Image files: Please use OCR software to extract text first, then save as .txt format.', 'info');
-        throw new Error('Please extract text from image using OCR tools first');
-    }
+        try {
+            this.els.progressFill.style.width = '20%';
+            this.els.progressText.textContent = 'Extracting text...';
 
-    prepareText() {
-        // Clean and split text into words
-        this.words = this.currentText
-            .replace(/\s+/g, ' ')
-            .trim()
-            .split(' ')
-            .filter(word => word.length > 0);
-        
-        this.currentWordIndex = 0;
-        this.updateProgress();
-    }
+            const text = await extractText(file);
 
-    displayText() {
-        const textDisplay = document.getElementById('textDisplay');
-        const wordsHtml = this.words.map((word, index) => 
-            `<span class="word" data-index="${index}">${this.escapeHtml(word)}</span>`
-        ).join(' ');
-        
-        textDisplay.innerHTML = wordsHtml;
+            this.els.progressFill.style.width = '80%';
 
-        // Add click handlers for word navigation
-        const wordElements = textDisplay.querySelectorAll('.word');
-        wordElements.forEach((element, index) => {
-            element.addEventListener('click', () => this.jumpToWord(index));
-        });
-    }
+            if (!text.trim()) throw new Error('No text found in file.');
 
-    escapeHtml(text) {
-        const div = document.createElement('div');
-        div.textContent = text;
-        return div.innerHTML;
-    }
-
-    jumpToWord(index) {
-        if (index >= 0 && index < this.words.length) {
-            this.currentWordIndex = index;
-            this.updateProgress();
-            this.highlightCurrentWord();
+            this.els.textInput.value = text.trim();
+            this.els.progressFill.style.width = '100%';
+            this.els.progressText.textContent = 'Done!';
+            this._toast('File loaded — ' + file.name, 'success');
+            this._updateButtons();
+        } catch (err) {
+            this._toast(err.message, 'error');
+        } finally {
+            this.els.loadingOverlay.classList.add('hidden');
+            setTimeout(() => this.els.uploadProgress.classList.add('hidden'), 1500);
         }
     }
 
-    updatePauseDuration(value) {
-        this.pauseDuration = parseFloat(value) * 1000; // Convert to milliseconds
-        document.getElementById('pauseValue').textContent = value;
-        this.saveUserPreferences();
+    // ── Playback ──
+
+    _getWords() {
+        const text = this.els.textInput.value.trim();
+        if (!text) return [];
+        return text.replace(/\s+/g, ' ').split(' ').filter(Boolean);
     }
 
     async play() {
-        if (this.words.length === 0) {
-            this.showStatus('Please upload a text file first', 'info');
+        const words = this._getWords();
+        if (words.length === 0) {
+            this._toast('Enter or upload some text first', 'info');
             return;
         }
 
-        if (!this.selectedVoice) {
-            this.showStatus('Please wait for voices to load or select a voice', 'info');
+        // If resuming from pause
+        if (this.isPaused && this.isPlaying) {
+            this._resume();
             return;
         }
 
+        // Fresh start
+        speechSynthesis.cancel();
+        this.words = words;
+        this.wordIndex = 0;
         this.isPlaying = true;
         this.isPaused = false;
-        this.updateControlButtons();
-        
-        await this.speakWords();
+        this._abortController = new AbortController();
+        this._updateButtons();
+        this.els.readingStatus.classList.remove('hidden');
+
+        await this._readLoop();
     }
 
-    async speakWords() {
-        while (this.isPlaying && this.currentWordIndex < this.words.length) {
+    async _readLoop() {
+        while (this.wordIndex < this.words.length && this.isPlaying) {
+            // Check pause
             if (this.isPaused) {
-                await this.waitForResume();
+                await this._waitForResume();
+                if (!this.isPlaying) break;
+            }
+
+            // Update progress (no word highlighting per spec)
+            this.els.readingProgress.textContent =
+                `Word ${this.wordIndex + 1} of ${this.words.length}`;
+
+            const word = this.words[this.wordIndex];
+
+            // Speak via active engine
+            try {
+                if (this.engine === 'piper' && this.piperTTS.ready) {
+                    await this.piperTTS.speak(word);
+                } else {
+                    await this.browserTTS.speak(word);
+                }
+            } catch (err) {
+                console.warn('TTS error on word:', word, err);
             }
 
             if (!this.isPlaying) break;
 
-            this.highlightCurrentWord();
-            await this.speakCurrentWord();
-            
-            if (this.isPlaying) {
-                this.currentWordIndex++;
-                this.updateProgress();
-                
-                // Add pause between words (except for the last word)
-                if (this.currentWordIndex < this.words.length && this.isPlaying) {
-                    await this.sleep(this.pauseDuration);
-                }
+            this.wordIndex++;
+
+            // Pause between words
+            if (this.wordIndex < this.words.length && this.isPlaying && !this.isPaused) {
+                await this._sleep(this.pauseMs);
             }
         }
 
-        if (this.currentWordIndex >= this.words.length) {
-            this.showStatus('Reading completed! 🎉', 'success');
+        // Completed
+        if (this.isPlaying && this.wordIndex >= this.words.length) {
+            this._toast('Finished reading!', 'success');
             this.stop();
         }
     }
 
-    async speakCurrentWord() {
-        return new Promise((resolve) => {
-            if (!this.selectedVoice || !this.isPlaying) {
-                resolve();
-                return;
-            }
-
-            const word = this.words[this.currentWordIndex];
-            const utterance = new SpeechSynthesisUtterance(word);
-            
-            utterance.voice = this.selectedVoice;
-            utterance.rate = 0.8;
-            utterance.pitch = 1.0;
-            utterance.volume = 1.0;
-
-            utterance.onend = () => {
-                this.currentUtterance = null;
-                resolve();
-            };
-
-            utterance.onerror = (event) => {
-                console.error('Speech synthesis error:', event);
-                this.currentUtterance = null;
-                resolve();
-            };
-
-            this.currentUtterance = utterance;
-            this.speechSynthesis.speak(utterance);
-        });
-    }
-
-    async waitForResume() {
-        return new Promise((resolve) => {
-            const checkResume = () => {
-                if (!this.isPaused || !this.isPlaying) {
-                    resolve();
-                } else {
-                    setTimeout(checkResume, 100);
-                }
-            };
-            checkResume();
-        });
-    }
-
-    sleep(ms) {
-        return new Promise(resolve => setTimeout(resolve, ms));
-    }
-
-    pause() {
-        if (!this.isPlaying) return;
-        
-        this.isPaused = true;
-        if (this.currentUtterance) {
-            this.speechSynthesis.pause();
+    togglePauseResume() {
+        if (this.isPaused) {
+            this._resume();
+        } else {
+            this._pause();
         }
-        this.updateControlButtons();
-        this.showStatus('Reading paused', 'info');
+    }
+
+    _pause() {
+        if (!this.isPlaying) return;
+        this.isPaused = true;
+        speechSynthesis.cancel(); // cancel current word utterance
+        this._updateButtons();
+    }
+
+    _resume() {
+        if (!this.isPlaying) return;
+        this.isPaused = false;
+        this._updateButtons();
+        // The _readLoop's _waitForResume will resolve and continue
     }
 
     stop() {
         this.isPlaying = false;
         this.isPaused = false;
-        this.speechSynthesis.cancel();
-        this.currentUtterance = null;
-        this.updateControlButtons();
-        this.clearWordHighlights();
-        this.showStatus('Reading stopped', 'info');
+        speechSynthesis.cancel();
+        this.wordIndex = 0;
+        this.els.readingStatus.classList.add('hidden');
+        this._updateButtons();
     }
 
-    restart() {
-        this.stop();
-        this.currentWordIndex = 0;
-        this.updateProgress();
-        setTimeout(() => {
-            this.highlightCurrentWord();
-            this.play();
-        }, 200);
-    }
-
-    highlightCurrentWord() {
-        // Clear previous highlights
-        this.clearWordHighlights();
-
-        // Highlight current word
-        const wordElements = document.querySelectorAll('.word');
-        if (wordElements[this.currentWordIndex]) {
-            wordElements[this.currentWordIndex].classList.add('current');
-            
-            // Mark previous words as spoken
-            for (let i = 0; i < this.currentWordIndex; i++) {
-                wordElements[i].classList.add('spoken');
-            }
-
-            // Scroll to current word
-            wordElements[this.currentWordIndex].scrollIntoView({
-                behavior: 'smooth',
-                block: 'center'
-            });
-        }
-    }
-
-    clearWordHighlights() {
-        const wordElements = document.querySelectorAll('.word');
-        wordElements.forEach(element => {
-            element.classList.remove('current', 'spoken');
+    _waitForResume() {
+        return new Promise((resolve) => {
+            const check = () => {
+                if (!this.isPaused || !this.isPlaying) resolve();
+                else setTimeout(check, 80);
+            };
+            check();
         });
     }
 
-    updateProgress() {
-        const progressElement = document.getElementById('wordProgress');
-        if (this.words.length > 0) {
-            progressElement.textContent = `${this.currentWordIndex + 1} / ${this.words.length} words`;
-        } else {
-            progressElement.textContent = '0 / 0 words';
-        }
+    _sleep(ms) {
+        return new Promise((resolve) => {
+            const id = setTimeout(resolve, ms);
+            // Allow stop to break out of sleep
+            const check = setInterval(() => {
+                if (!this.isPlaying) {
+                    clearTimeout(id);
+                    clearInterval(check);
+                    resolve();
+                }
+            }, 50);
+            setTimeout(() => clearInterval(check), ms + 10);
+        });
     }
 
-    updateControlButtons() {
-        const playBtn = document.getElementById('playBtn');
-        const pauseBtn = document.getElementById('pauseBtn');
-        const stopBtn = document.getElementById('stopBtn');
-        const restartBtn = document.getElementById('restartBtn');
+    // ── UI Updates ──
 
-        const hasText = this.words.length > 0;
-        const hasVoice = this.selectedVoice !== null;
+    _updateButtons() {
+        const hasText = this._getWords().length > 0 || this.els.textInput.value.trim().length > 0;
+        const hasVoice = this.engine === 'browser'
+            ? this.browserTTS.selectedVoice !== null
+            : this.piperTTS.ready;
 
         if (this.isPlaying && !this.isPaused) {
-            playBtn.disabled = true;
-            pauseBtn.disabled = false;
-            stopBtn.disabled = false;
-            restartBtn.disabled = false;
-        } else if (this.isPaused) {
-            playBtn.disabled = false;
-            pauseBtn.disabled = true;
-            stopBtn.disabled = false;
-            restartBtn.disabled = false;
+            this.els.playBtn.disabled = true;
+            this.els.pauseResumeBtn.disabled = false;
+            this.els.pauseResumeBtn.textContent = '⏸ Pause';
+            this.els.stopBtn.disabled = false;
+        } else if (this.isPlaying && this.isPaused) {
+            this.els.playBtn.disabled = false;
+            this.els.playBtn.textContent = '▶ Resume';
+            this.els.pauseResumeBtn.disabled = true;
+            this.els.pauseResumeBtn.textContent = '⏸ Pause';
+            this.els.stopBtn.disabled = false;
         } else {
-            playBtn.disabled = !hasText || !hasVoice;
-            pauseBtn.disabled = true;
-            stopBtn.disabled = true;
-            restartBtn.disabled = !hasText || !hasVoice;
+            this.els.playBtn.disabled = !hasText || !hasVoice;
+            this.els.playBtn.textContent = '▶ Play';
+            this.els.pauseResumeBtn.disabled = true;
+            this.els.stopBtn.disabled = true;
         }
     }
 
-    enableControls() {
-        this.updateControlButtons();
-    }
-
-    showLoading(show) {
-        const overlay = document.getElementById('loadingOverlay');
-        if (show) {
-            overlay.classList.remove('hidden');
-        } else {
-            overlay.classList.add('hidden');
-        }
-    }
-
-    showProgress(percentage) {
-        const progressSection = document.getElementById('uploadProgress');
-        const progressFill = document.getElementById('progressFill');
-        
-        progressSection.classList.remove('hidden');
-        progressFill.style.width = `${percentage}%`;
-    }
-
-    hideProgress() {
-        const progressSection = document.getElementById('uploadProgress');
-        progressSection.classList.add('hidden');
-    }
-
-    showStatus(message, type) {
-        const statusElement = document.getElementById('statusMessage');
-        const statusIcon = statusElement.querySelector('.status-icon');
-        const statusText = statusElement.querySelector('.status-text');
-
-        const icons = {
-            success: '✅',
-            error: '❌',
-            info: 'ℹ️'
-        };
-
-        statusIcon.textContent = icons[type] || 'ℹ️';
-        statusText.textContent = message;
-        statusElement.className = `status-message ${type}`;
-        statusElement.classList.remove('hidden');
-
-        // Auto-hide after 5 seconds
-        setTimeout(() => {
-            statusElement.classList.add('hidden');
-        }, 5000);
-    }
-
-    // File download functionality
-    downloadFile(type) {
-        let content, filename, mimeType;
-
-        switch (type) {
-            case 'html':
-                content = this.getHtmlContent();
-                filename = 'audio-reading-app.html';
-                mimeType = 'text/html';
-                break;
-            case 'css':
-                content = this.getCssContent();
-                filename = 'style.css';
-                mimeType = 'text/css';
-                break;
-            case 'js':
-                content = this.getJsContent();
-                filename = 'app.js';
-                mimeType = 'text/javascript';
-                break;
-        }
-
-        this.downloadBlob(content, filename, mimeType);
-        this.showStatus(`${filename} downloaded successfully!`, 'success');
-    }
-
-    downloadAllFiles() {
-        // Download all files sequentially with small delays
-        this.downloadFile('html');
-        setTimeout(() => this.downloadFile('css'), 200);
-        setTimeout(() => this.downloadFile('js'), 400);
-        
-        this.showStatus('All files downloaded! 📦', 'success');
-    }
-
-    downloadBlob(content, filename, mimeType) {
-        const blob = new Blob([content], { type: mimeType });
-        const url = URL.createObjectURL(blob);
-        const a = document.createElement('a');
-        a.href = url;
-        a.download = filename;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        URL.revokeObjectURL(url);
-    }
-
-    getHtmlContent() {
-        return document.documentElement.outerHTML;
-    }
-
-    getCssContent() {
-        // Return the current stylesheet content
-        let css = '/* Audio Reading App - Complete CSS */\n\n';
-        
-        // Add basic CSS rules
-        try {
-            for (const stylesheet of document.styleSheets) {
-                if (stylesheet.href && stylesheet.href.includes('style.css')) {
-                    for (const rule of stylesheet.cssRules) {
-                        css += rule.cssText + '\n';
-                    }
-                }
-            }
-        } catch (e) {
-            css += '/* Could not extract all CSS rules due to CORS restrictions */\n';
-            css += '/* Please ensure all CSS is included in the style.css file */\n';
-        }
-        
-        return css;
-    }
-
-    getJsContent() {
-        // Return the current JavaScript code as a string
-        return `// Audio Reading App for Kids - Complete JavaScript
-${this.constructor.toString()}
-
-// Initialize the app when the page loads
-document.addEventListener('DOMContentLoaded', () => {
-    new AudioReadingApp();
-});`;
-    }
-
-    // User preferences (simplified for sandbox environment)
-    saveUserPreferences() {
-        // Note: localStorage is not available in sandbox environment
-        // In a real deployment, this would save user preferences
-        console.log('Preferences saved:', {
-            pauseDuration: this.pauseDuration,
-            selectedVoice: this.selectedVoice ? this.selectedVoice.name : null
-        });
-    }
-
-    loadUserPreferences() {
-        // Note: localStorage is not available in sandbox environment
-        // Using default values
-        this.pauseDuration = 1000; // 1 second default
-        document.getElementById('pauseSlider').value = 1.0;
-        document.getElementById('pauseValue').textContent = '1.0';
+    _toast(message, type = 'info') {
+        const icons = { success: '✅', error: '❌', info: 'ℹ️' };
+        this.els.toastIcon.textContent = icons[type] || 'ℹ️';
+        this.els.toastText.textContent = message;
+        this.els.statusToast.classList.remove('hidden');
+        clearTimeout(this._toastTimer);
+        this._toastTimer = setTimeout(() => {
+            this.els.statusToast.classList.add('hidden');
+        }, 4000);
     }
 }
 
-// Initialize the app when the page loads
+// ── Bootstrap ─────────────────────────────────────────────────────────────────
+
 document.addEventListener('DOMContentLoaded', () => {
-    new AudioReadingApp();
+    window.app = new ReadingApp();
 });

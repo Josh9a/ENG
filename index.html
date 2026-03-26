@@ -2,33 +2,43 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Audio Reading App for Kids</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>English Reader - Indian Voices</title>
     <link rel="stylesheet" href="style.css">
 </head>
 <body>
     <div class="container">
         <header class="app-header">
-            <h1>📚 Audio Reading App</h1>
-            <p>Upload text or images and listen word-by-word with customizable pauses</p>
+            <h1>English Reader</h1>
+            <p>Type, paste, or upload — hear it read word-by-word with Indian English voices</p>
         </header>
 
         <main class="app-main">
-            <!-- File Upload Section -->
-            <section class="upload-section">
+            <!-- Input Section -->
+            <section class="input-section">
                 <div class="card">
-                    <div class="upload-area" id="uploadArea">
-                        <div class="upload-icon">📁</div>
-                        <h3>Upload Your File</h3>
-                        <p>Drag & drop or click to select</p>
-                        <p class="supported-formats">Supports: .txt, .docx, .pdf, .jpg, .png, .jpeg, .gif, .bmp</p>
-                        <input type="file" id="fileInput" accept=".txt,.docx,.pdf,.jpg,.jpeg,.png,.gif,.bmp" class="file-input">
-                    </div>
-                    <div class="upload-progress hidden" id="uploadProgress">
-                        <div class="progress-bar">
-                            <div class="progress-fill" id="progressFill"></div>
+                    <div class="card__body">
+                        <h3>Text Input</h3>
+                        <textarea id="textInput" class="form-control" rows="6"
+                            placeholder="Type or paste your text here..."></textarea>
+
+                        <div class="divider"><span>or upload a file</span></div>
+
+                        <div class="upload-area" id="uploadArea">
+                            <div class="upload-icon">📁</div>
+                            <p><strong>Drag & drop</strong> or <strong>tap to select</strong></p>
+                            <p class="supported-formats">.txt .docx .pdf .jpg .png .jpeg .gif .bmp</p>
+                            <input type="file" id="fileInput"
+                                accept=".txt,.docx,.pdf,.jpg,.jpeg,.png,.gif,.bmp"
+                                class="file-input">
                         </div>
-                        <p class="progress-text" id="progressText">Processing file...</p>
+
+                        <div class="upload-progress hidden" id="uploadProgress">
+                            <div class="progress-bar">
+                                <div class="progress-fill" id="progressFill"></div>
+                            </div>
+                            <p class="progress-text" id="progressText">Processing...</p>
+                        </div>
                     </div>
                 </div>
             </section>
@@ -36,97 +46,119 @@
             <!-- Controls Section -->
             <section class="controls-section">
                 <div class="card">
-                    <h3>Audio Settings</h3>
-                    
-                    <!-- Pause Duration Control -->
-                    <div class="control-group">
-                        <label for="pauseSlider" class="form-label">
-                            Pause Duration: <span id="pauseValue">1.0</span> seconds
-                        </label>
-                        <input type="range" id="pauseSlider" class="pause-slider" 
-                               min="0.5" max="2.0" step="0.1" value="1.0">
-                        <div class="slider-labels">
-                            <span>0.5s</span>
-                            <span>2.0s</span>
+                    <div class="card__body">
+                        <h3>Voice & Settings</h3>
+
+                        <!-- TTS Engine Toggle -->
+                        <div class="control-group">
+                            <label class="form-label">TTS Engine</label>
+                            <div class="engine-toggle">
+                                <button class="engine-btn active" data-engine="browser" id="btnEngineBrowser">
+                                    Browser Voices
+                                </button>
+                                <button class="engine-btn" data-engine="piper" id="btnEnginePiper">
+                                    Piper Offline
+                                </button>
+                            </div>
                         </div>
-                    </div>
 
-                    <!-- Voice Selection -->
-                    <div class="control-group">
-                        <label for="voiceSelect" class="form-label">Voice</label>
-                        <select id="voiceSelect" class="form-control">
-                            <option value="">Loading voices...</option>
-                        </select>
-                    </div>
-
-                    <!-- Audio Controls -->
-                    <div class="audio-controls">
-                        <button id="playBtn" class="btn btn--primary" disabled>
-                            <span class="btn-icon">▶️</span> Play
-                        </button>
-                        <button id="pauseBtn" class="btn btn--secondary" disabled>
-                            <span class="btn-icon">⏸️</span> Pause
-                        </button>
-                        <button id="stopBtn" class="btn btn--outline" disabled>
-                            <span class="btn-icon">⏹️</span> Stop
-                        </button>
-                        <button id="restartBtn" class="btn btn--outline" disabled>
-                            <span class="btn-icon">🔄</span> Restart
-                        </button>
-                    </div>
-                </div>
-            </section>
-
-            <!-- Text Display Section -->
-            <section class="text-section">
-                <div class="card">
-                    <div class="text-header">
-                        <h3>Text Content</h3>
-                        <div class="reading-progress">
-                            <span id="wordProgress">0 / 0 words</span>
+                        <!-- Browser Voice Selection -->
+                        <div id="browserVoicePanel">
+                            <div class="control-group">
+                                <label for="voiceSelect" class="form-label">Voice</label>
+                                <select id="voiceSelect" class="form-control">
+                                    <option value="">Loading voices...</option>
+                                </select>
+                            </div>
                         </div>
-                    </div>
-                    <div class="text-display" id="textDisplay">
-                        <p class="placeholder-text">Upload a file to see the text content here. Each word will be highlighted as it's being read.</p>
-                    </div>
-                </div>
-            </section>
 
-            <!-- Download Section -->
-            <section class="download-section">
-                <div class="card">
-                    <h3>Download App Files</h3>
-                    <p>Download the complete application files for offline use</p>
-                    <div class="download-buttons">
-                        <button id="downloadHtml" class="btn btn--secondary">
-                            <span class="btn-icon">📄</span> Download HTML
-                        </button>
-                        <button id="downloadCss" class="btn btn--secondary">
-                            <span class="btn-icon">🎨</span> Download CSS
-                        </button>
-                        <button id="downloadJs" class="btn btn--secondary">
-                            <span class="btn-icon">⚡</span> Download JS
-                        </button>
-                        <button id="downloadAll" class="btn btn--primary">
-                            <span class="btn-icon">📦</span> Download All
-                        </button>
+                        <!-- Piper Voice Panel (hidden by default) -->
+                        <div id="piperVoicePanel" class="hidden">
+                            <div class="control-group">
+                                <label for="piperVoiceSelect" class="form-label">Offline Voice</label>
+                                <select id="piperVoiceSelect" class="form-control">
+                                    <option value="en_GB-jenny_dioco-medium">Jenny (British Female)</option>
+                                    <option value="en_GB-northern_english_male-medium">Northern English (Male)</option>
+                                    <option value="en_GB-cori-medium">Cori (British Female)</option>
+                                    <option value="en_GB-alba-medium">Alba (Scottish Female)</option>
+                                    <option value="en_US-lessac-medium">Lessac (American Female)</option>
+                                    <option value="en_US-libritts_r-medium">LibriTTS (American Multi)</option>
+                                    <option value="en_US-joe-medium">Joe (American Male)</option>
+                                    <option value="en_US-amy-medium">Amy (American Female)</option>
+                                </select>
+                                <button id="downloadVoiceBtn" class="btn btn--primary btn--sm mt-8">
+                                    Download Voice Model
+                                </button>
+                                <div id="piperStatus" class="piper-status hidden"></div>
+                                <div id="modelProgress" class="hidden mt-8">
+                                    <div class="progress-bar">
+                                        <div class="progress-fill" id="modelProgressFill"></div>
+                                    </div>
+                                    <p class="progress-text" id="modelProgressText">Downloading model...</p>
+                                </div>
+                            </div>
+                        </div>
+
+                        <!-- Pause Duration -->
+                        <div class="control-group">
+                            <label for="pauseSlider" class="form-label">
+                                Pause between words: <strong><span id="pauseValue">1.0</span>s</strong>
+                            </label>
+                            <input type="range" id="pauseSlider" class="pause-slider"
+                                min="0.5" max="2.0" step="0.1" value="1.0">
+                            <div class="slider-labels">
+                                <span>0.5s</span>
+                                <span>2.0s</span>
+                            </div>
+                        </div>
+
+                        <!-- Speed -->
+                        <div class="control-group">
+                            <label for="speedSlider" class="form-label">
+                                Speech speed: <strong><span id="speedValue">1.0</span>x</strong>
+                            </label>
+                            <input type="range" id="speedSlider" class="pause-slider"
+                                min="0.5" max="2.0" step="0.1" value="1.0">
+                            <div class="slider-labels">
+                                <span>0.5x</span>
+                                <span>2.0x</span>
+                            </div>
+                        </div>
+
+                        <!-- Playback Controls -->
+                        <div class="audio-controls">
+                            <button id="playBtn" class="btn btn--primary" disabled>
+                                ▶ Play
+                            </button>
+                            <button id="pauseResumeBtn" class="btn btn--secondary" disabled>
+                                ⏸ Pause
+                            </button>
+                            <button id="stopBtn" class="btn btn--outline" disabled>
+                                ⏹ Stop
+                            </button>
+                        </div>
+
+                        <!-- Reading Progress -->
+                        <div id="readingStatus" class="reading-status hidden">
+                            <span id="readingProgress">Word 0 of 0</span>
+                        </div>
                     </div>
                 </div>
             </section>
         </main>
 
-        <!-- Status Messages -->
-        <div id="statusMessage" class="status-message hidden">
-            <div class="status-content">
-                <span class="status-icon"></span>
-                <span class="status-text"></span>
+        <!-- Status Toast -->
+        <div id="statusToast" class="status-toast hidden">
+            <div class="status-toast-content">
+                <span id="toastIcon"></span>
+                <span id="toastText"></span>
             </div>
         </div>
 
         <!-- Loading Overlay -->
         <div id="loadingOverlay" class="loading-overlay hidden">
             <div class="loading-spinner"></div>
-            <p>Processing your file...</p>
+            <p id="loadingText">Processing file...</p>
         </div>
     </div>
 
